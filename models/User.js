@@ -7,6 +7,9 @@ const statSchema = new mongoose.Schema({
   errors: Number,
   mode: { type: String, enum: ['practice', 'test'], default: 'test' },
   duration: Number, // seconds
+  category: { type: String, default: 'English' },
+  difficulty: { type: String, default: 'Medium' },
+  language: { type: String, default: 'English' },
   date: { type: Date, default: Date.now },
 });
 
@@ -27,12 +30,25 @@ const userSchema = new mongoose.Schema(
     streak: { type: Number, default: 0 },
     lastPracticeDate: { type: Date },
     level: { type: String, enum: ['beginner', 'intermediate', 'pro'], default: null },
+    language: { type: String, enum: ['English', 'Spanish', 'French', 'German', 'Japanese', 'Chinese'], default: 'English' },
     theme: {
       background: { type: String, default: '#0f0f0f' },
       text: { type: String, default: '#e2e8f0' },
       accent: { type: String, default: '#6366f1' },
       mode: { type: String, default: 'dark' },
     },
+    friends: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    friendRequestsSent: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    friendRequestsReceived: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    raceWins: { type: Number, default: 0 },
+    raceLosses: { type: Number, default: 0 },
+    achievements: [
+      {
+        name: { type: String, required: true },
+        unlockedAt: { type: Date, default: Date.now }
+      }
+    ],
   },
   { timestamps: true }
 );
