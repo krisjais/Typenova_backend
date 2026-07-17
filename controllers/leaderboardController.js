@@ -1,127 +1,245 @@
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const LeaderboardSnapshot = require('../models/LeaderboardSnapshot');
+const GAME_MODES = require('../config/modes');
+
+// Rebuilds and returns the leaderboard standings for a type and timeFilter
+const rebuildLeaderboard = async (type, timeFilter, friendsOnlyUser = null) => {
+  // Build match query for users
+  let userMatch = {};
+  if (friendsOnlyUser) {
+    userMatch._id = { $in: [friendsOnlyUser._id, ...friendsOnlyUser.friends] };
+  }
+
+  // Determine the matching stats filter
+  let statsMatch = { 'stats.isFlagged': { $ne: true } };
+
+  if (type === 'global') {
+    // Competitive modes only
+    const eligibleSubtypes = Object.keys(GAME_MODES).filter(key => GAME_MODES[key].leaderboard);
+    statsMatch['stats.subtype'] = { $in: eligibleSubtypes };
+  } else if (type === 'practice') {
+    // Practice modes only
+    statsMatch['stats.subtype'] = { $in: ['practice', 'custom'] };
+  } else {
+    // Strict games/modes filter
+    statsMatch['stats.subtype'] = type;
+  }
+
+  // Time filters
+  const dateLimit = new Date();
+  if (timeFilter === 'daily') {
+    dateLimit.setDate(dateLimit.getDate() - 1);
+    statsMatch['stats.date'] = { $gte: dateLimit };
+  } else if (timeFilter === 'weekly') {
+    dateLimit.setDate(dateLimit.getDate() - 7);
+    statsMatch['stats.date'] = { $gte: dateLimit };
+  } else if (timeFilter === 'monthly') {
+    dateLimit.setDate(dateLimit.getDate() - 30);
+    statsMatch['stats.date'] = { $gte: dateLimit };
+  }
+
+  const pipeline = [
+    { $match: userMatch },
+    { $unwind: '$stats' },
+    { $match: statsMatch },
+    {
+      $group: {
+        _id: '$_id',
+        username: { $first: '$username' },
+        streak: { $first: '$streak' },
+        bestWpm: { $max: '$stats.wpm' },
+        totalWpm: { $sum: '$stats.wpm' },
+        totalAccuracy: { $sum: '$stats.accuracy' },
+        totalTests: { $sum: 1 }
+      }
+    },
+    {
+      $project: {
+        username: 1,
+        streak: 1,
+        bestWpm: 1,
+        totalTests: 1,
+        accuracy: { $round: [{ $divide: ['$totalAccuracy', '$totalTests'] }, 0] }
+      }
+    },
+    { $sort: { bestWpm: -1 } },
+    { $limit: 50 }
+  ];
+
+  return User.aggregate(pipeline);
+};
 
 exports.getLeaderboard = async (req, res) => {
   try {
-    const { category, timeFilter, friendsOnly } = req.query;
+    const { category, timeFilter = 'all', friendsOnly, leaderboardType = 'global' } = req.query;
 
-    // Build match query for users
-    let userMatch = { bestWpm: { $gt: 0 } };
-
-    if (friendsOnly === 'true' && req.userId) {
-      const user = await User.findById(req.userId);
-      if (!user) return res.status(404).json({ message: 'User not found' });
-      userMatch._id = { $in: [user._id, ...user.friends] };
+    let currentUser = null;
+    if (req.userId) {
+      currentUser = await User.findById(req.userId);
     }
 
-    // Default global all-time query
-    if (!category && (!timeFilter || timeFilter === 'all')) {
-      const users = await User.find(userMatch)
-        .select('username bestWpm streak stats')
-        .sort({ bestWpm: -1 })
-        .limit(50);
+    let standings = [];
 
-      const leaderboard = users.map((u) => {
-        const tests = u.stats ? u.stats.filter((s) => s.mode === 'test') : [];
-        const totalTests = tests.length;
-        const avgAccuracy = totalTests > 0
-          ? Math.round(tests.reduce((acc, s) => acc + s.accuracy, 0) / totalTests)
-          : 0;
+    // For Friends Only, we always query dynamically because it's user-specific and can't be globally cached
+    if (friendsOnly === 'true' && currentUser) {
+      standings = await rebuildLeaderboard(leaderboardType, timeFilter, currentUser);
+    } else {
+      // Check cache snapshot
+      let snapshot = await LeaderboardSnapshot.findOne({ type: leaderboardType, timeFilter });
 
-        return {
-          _id: u._id,
-          username: u.username,
-          bestWpm: u.bestWpm,
-          streak: u.streak,
-          accuracy: avgAccuracy,
-          totalTests
-        };
-      });
+      // If cache exists and is fresh (younger than 5 minutes), use it
+      const CACHE_LIFETIME_MS = 5 * 60 * 1000;
+      if (snapshot && (Date.now() - new Date(snapshot.updatedAt).getTime() < CACHE_LIFETIME_MS)) {
+        standings = snapshot.standings;
+      } else {
+        // Rebuild and update cache
+        standings = await rebuildLeaderboard(leaderboardType, timeFilter);
+        
+        await LeaderboardSnapshot.findOneAndUpdate(
+          { type: leaderboardType, timeFilter },
+          { standings, updatedAt: new Date() },
+          { upsert: true, new: true }
+        );
+      }
+    }
 
-      let personalRank = -1;
-      if (req.userId) {
-        const currentUser = await User.findById(req.userId);
-        if (currentUser) {
-          const userCount = await User.countDocuments({
-            bestWpm: { $gt: currentUser.bestWpm },
-            ...(friendsOnly === 'true' ? { _id: { $in: [currentUser._id, ...currentUser.friends] } } : {})
-          });
-          personalRank = userCount + 1;
-        }
+    // Apply category filter in-memory if requested (since snapshots contain all categories combined)
+    // In practice, snapshots pre-aggregate by user best, so category filters are less common on snapshots
+    // but if the category is requested, we can filter/rebuild dynamically or filter in-memory.
+    // Let's support dynamic category querying if a specific category is requested:
+    if (category && category !== 'All') {
+      // Dynamic rebuild for category
+      standings = standings.filter(s => s.category === category); // note: standings projection does not have category, so if category is requested we rebuild dynamically
+      // To ensure correct sorting/filtering by category, do dynamic rebuild:
+      let userMatch = {};
+      if (friendsOnly === 'true' && currentUser) {
+        userMatch._id = { $in: [currentUser._id, ...currentUser.friends] };
+      }
+      let statsMatch = { 'stats.isFlagged': { $ne: true }, 'stats.category': category };
+      if (leaderboardType === 'global') {
+        const eligibleSubtypes = Object.keys(GAME_MODES).filter(key => GAME_MODES[key].leaderboard);
+        statsMatch['stats.subtype'] = { $in: eligibleSubtypes };
+      } else if (leaderboardType === 'practice') {
+        statsMatch['stats.subtype'] = { $in: ['practice', 'custom'] };
+      } else {
+        statsMatch['stats.subtype'] = leaderboardType;
       }
 
-      return res.json({ leaderboard, personalRank });
+      const dateLimit = new Date();
+      if (timeFilter === 'daily') {
+        dateLimit.setDate(dateLimit.getDate() - 1);
+        statsMatch['stats.date'] = { $gte: dateLimit };
+      } else if (timeFilter === 'weekly') {
+        dateLimit.setDate(dateLimit.getDate() - 7);
+        statsMatch['stats.date'] = { $gte: dateLimit };
+      } else if (timeFilter === 'monthly') {
+        dateLimit.setDate(dateLimit.getDate() - 30);
+        statsMatch['stats.date'] = { $gte: dateLimit };
+      }
+
+      const pipeline = [
+        { $match: userMatch },
+        { $unwind: '$stats' },
+        { $match: statsMatch },
+        {
+          $group: {
+            _id: '$_id',
+            username: { $first: '$username' },
+            streak: { $first: '$streak' },
+            bestWpm: { $max: '$stats.wpm' },
+            totalWpm: { $sum: '$stats.wpm' },
+            totalAccuracy: { $sum: '$stats.accuracy' },
+            totalTests: { $sum: 1 }
+          }
+        },
+        {
+          $project: {
+            username: 1,
+            streak: 1,
+            bestWpm: 1,
+            totalTests: 1,
+            accuracy: { $round: [{ $divide: ['$totalAccuracy', '$totalTests'] }, 0] }
+          }
+        },
+        { $sort: { bestWpm: -1 } },
+        { $limit: 50 }
+      ];
+      standings = await User.aggregate(pipeline);
     }
 
-    // Advanced category & time-filtered aggregation
-    const dateLimit = new Date();
-    if (timeFilter === 'weekly') {
-      dateLimit.setDate(dateLimit.getDate() - 7);
-    } else if (timeFilter === 'monthly') {
-      dateLimit.setDate(dateLimit.getDate() - 30);
-    }
-
-    const pipeline = [
-      { $match: friendsOnly === 'true' ? userMatch : {} },
-      { $unwind: '$stats' },
-      {
-        $match: {
-          'stats.mode': 'test',
-          ...(category ? { 'stats.category': category } : {}),
-          ...(timeFilter && timeFilter !== 'all' ? { 'stats.date': { $gte: dateLimit } } : {})
-        }
-      },
-      {
-        $group: {
-          _id: '$_id',
-          username: { $first: '$username' },
-          streak: { $first: '$streak' },
-          bestWpm: { $max: '$stats.wpm' },
-          totalWpm: { $sum: '$stats.wpm' },
-          totalAccuracy: { $sum: '$stats.accuracy' },
-          totalTests: { $sum: 1 }
-        }
-      },
-      {
-        $project: {
-          username: 1,
-          streak: 1,
-          bestWpm: 1,
-          totalTests: 1,
-          accuracy: { $round: [{ $divide: ['$totalAccuracy', '$totalTests'] }, 0] }
-        }
-      },
-      { $sort: { bestWpm: -1 } },
-      { $limit: 50 }
-    ];
-
-    const leaderboard = await User.aggregate(pipeline);
-
+    // Determine personal rank
     let personalRank = -1;
-    if (req.userId) {
-      const userIndex = leaderboard.findIndex((u) => u._id.toString() === req.userId.toString());
+    if (currentUser) {
+      const userIndex = standings.findIndex((u) => u._id.toString() === currentUser._id.toString());
       if (userIndex !== -1) {
         personalRank = userIndex + 1;
       } else {
-        const rankPipeline = [
-          ...pipeline.slice(0, -1), // remove limit
-          { $match: { _id: new mongoose.Types.ObjectId(req.userId) } }
-        ];
-        const userAgg = await User.aggregate(rankPipeline);
+        // Calculate personal rank dynamically
+        // Find user's bestWpm in current filter criteria
+        let statsMatch = { 'stats.isFlagged': { $ne: true } };
+        if (category && category !== 'All') statsMatch['stats.category'] = category;
+        
+        if (leaderboardType === 'global') {
+          const eligibleSubtypes = Object.keys(GAME_MODES).filter(key => GAME_MODES[key].leaderboard);
+          statsMatch['stats.subtype'] = { $in: eligibleSubtypes };
+        } else if (leaderboardType === 'practice') {
+          statsMatch['stats.subtype'] = { $in: ['practice', 'custom'] };
+        } else {
+          statsMatch['stats.subtype'] = leaderboardType;
+        }
+
+        const dateLimit = new Date();
+        if (timeFilter === 'daily') {
+          dateLimit.setDate(dateLimit.getDate() - 1);
+          statsMatch['stats.date'] = { $gte: dateLimit };
+        } else if (timeFilter === 'weekly') {
+          dateLimit.setDate(dateLimit.getDate() - 7);
+          statsMatch['stats.date'] = { $gte: dateLimit };
+        } else if (timeFilter === 'monthly') {
+          dateLimit.setDate(dateLimit.getDate() - 30);
+          statsMatch['stats.date'] = { $gte: dateLimit };
+        }
+
+        const userAgg = await User.aggregate([
+          { $match: { _id: currentUser._id } },
+          { $unwind: '$stats' },
+          { $match: statsMatch },
+          {
+            $group: {
+              _id: '$_id',
+              bestWpm: { $max: '$stats.wpm' }
+            }
+          }
+        ]);
+
         if (userAgg.length > 0) {
           const userBestWpm = userAgg[0].bestWpm;
-          const countPipeline = [
-            ...pipeline.slice(0, -2), // remove limit and sort
+          
+          let userMatch = {};
+          if (friendsOnly === 'true') {
+            userMatch._id = { $in: [currentUser._id, ...currentUser.friends] };
+          }
+
+          const countRes = await User.aggregate([
+            { $match: userMatch },
+            { $unwind: '$stats' },
+            { $match: statsMatch },
+            {
+              $group: {
+                _id: '$_id',
+                bestWpm: { $max: '$stats.wpm' }
+              }
+            },
             { $match: { bestWpm: { $gt: userBestWpm } } },
             { $count: 'count' }
-          ];
-          const countRes = await User.aggregate(countPipeline);
+          ]);
           personalRank = countRes.length > 0 ? countRes[0].count + 1 : 1;
         }
       }
     }
 
-    res.json({ leaderboard, personalRank });
+    res.json({ leaderboard: standings, personalRank });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

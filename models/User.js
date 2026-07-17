@@ -5,11 +5,12 @@ const statSchema = new mongoose.Schema({
   wpm: Number,
   accuracy: Number,
   errors: Number,
-  mode: { type: String, enum: ['practice', 'test'], default: 'test' },
   duration: Number, // seconds
-  category: { type: String, default: 'English' },
-  difficulty: { type: String, default: 'Medium' },
-  language: { type: String, default: 'English' },
+  category: { type: String, enum: ['COMPETITIVE', 'PRACTICE'], default: 'COMPETITIVE' },
+  subtype: { type: String, required: true },
+  textId: { type: String },
+  consistency: { type: Number },
+  isFlagged: { type: Boolean, default: false },
   date: { type: Date, default: Date.now },
 });
 
@@ -27,6 +28,7 @@ const userSchema = new mongoose.Schema(
     stats: [statSchema],
     weakKeys: [weakKeySchema],
     bestWpm: { type: Number, default: 0 },
+    xp: { type: Number, default: 0 },
     streak: { type: Number, default: 0 },
     lastPracticeDate: { type: Date },
     level: { type: String, enum: ['beginner', 'intermediate', 'pro'], default: null },

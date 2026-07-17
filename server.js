@@ -4,7 +4,44 @@ const dotenv = require('dotenv');
 const connectDB = require('./config/db');
 
 dotenv.config();
-connectDB();
+connectDB().then(async () => {
+  try {
+    const OfficialText = require('./models/OfficialText');
+    const seedTexts = require('./config/officialTextsSeed');
+    const count = await OfficialText.countDocuments();
+    if (count === 0) {
+      console.log('Seeding official texts database...');
+      
+      const computeTextStats = (content) => {
+        const words = content.trim().split(/\s+/).filter(Boolean);
+        const wordCount = words.length;
+        const specialCharCount = content.replace(/[a-zA-Z0-9\s]/g, '').length;
+        const totalCharCountNoSpaces = content.replace(/\s+/g, '').length;
+        const avgWordLength = wordCount > 0 ? parseFloat((totalCharCountNoSpaces / wordCount).toFixed(1)) : 0;
+        return { wordCount, avgWordLength, specialCharCount };
+      };
+
+      const textsToInsert = seedTexts.map(t => {
+        const stats = computeTextStats(t.content);
+        return {
+          title: t.title,
+          content: t.content,
+          difficulty: t.difficulty,
+          category: t.category,
+          language: t.language || 'English',
+          wordCount: stats.wordCount,
+          avgWordLength: stats.avgWordLength,
+          specialCharCount: stats.specialCharCount
+        };
+      });
+
+      await OfficialText.insertMany(textsToInsert);
+      console.log('Successfully seeded OfficialText collection!');
+    }
+  } catch (err) {
+    console.error('Error seeding OfficialText database:', err.message);
+  }
+});
 
 const app = express();
 
