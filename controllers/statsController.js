@@ -3,6 +3,7 @@ const OfficialText = require('../models/OfficialText');
 const CustomText = require('../models/CustomText');
 const PendingSession = require('../models/PendingSession');
 const Activity = require('../models/Activity');
+const AuditLog = require('../models/AuditLog');
 const GAME_MODES = require('../config/modes');
 const ANTI_CHEAT = require('../config/antiCheat');
 const crypto = require('crypto');
@@ -10,31 +11,31 @@ const crypto = require('crypto');
 // Anti-Cheat Checker
 const checkAntiCheat = (pendingSession, wpm, accuracy, duration, text, errors) => {
   // 1. Check WPM limit
-  if (wpm > ANTI_CHEAT.MAX_WPM) return true;
+  if (wpm > ANTI_CHEAT.MAX_WPM) return 'WPM_LIMIT_EXCEEDED';
 
   // 2. Check Accuracy limit
-  if (accuracy > ANTI_CHEAT.MAX_ACCURACY) return true;
+  if (accuracy > ANTI_CHEAT.MAX_ACCURACY) return 'MAX_ACCURACY_EXCEEDED';
 
   // 3. Check Minimum duration
-  if (duration < ANTI_CHEAT.MIN_DURATION) return true;
+  if (duration < ANTI_CHEAT.MIN_DURATION) return 'MIN_DURATION_NOT_MET';
 
   // 4. Mismatched text validation (if hash exists)
   if (pendingSession.textHash) {
-    if (!text) return true; // text must be submitted to verify hash
+    if (!text) return 'TEXT_MISSING_FOR_HASH_VERIFICATION';
     const submittedHash = crypto.createHash('sha256').update(text).digest('hex');
-    if (submittedHash !== pendingSession.textHash) return true;
+    if (submittedHash !== pendingSession.textHash) return 'TEXT_HASH_MISMATCH';
 
     // 5. Compare WPM with calculated words per minute drift
     const correctChars = text.length - (errors || 0);
     const expectedWpm = Math.round((correctChars / 5) / (duration / 60));
-    if (Math.abs(wpm - expectedWpm) > ANTI_CHEAT.WPM_DRIFT_THRESHOLD) return true;
+    if (Math.abs(wpm - expectedWpm) > ANTI_CHEAT.WPM_DRIFT_THRESHOLD) return 'WPM_DRIFT_LIMIT_EXCEEDED';
   }
 
   // 6. Check Time elapsed speed-hacking check
   const timeElapsed = (Date.now() - new Date(pendingSession.createdAt).getTime()) / 1000;
-  if (timeElapsed < duration * 0.8) return true;
+  if (timeElapsed < duration * 0.8) return 'SPEED_HACK_ELAPSED_TIME';
 
-  return false;
+  return null;
 };
 
 exports.startStatsSession = async (req, res) => {
@@ -94,7 +95,6 @@ exports.startStatsSession = async (req, res) => {
         textContent = 'the quick brown fox jumps over the lazy dog';
       }
     } else if (req.body.text) {
-      // Dynamic games passing customized text (e.g. Type Racer)
       textContent = req.body.text;
     }
 
@@ -142,12 +142,26 @@ exports.saveStats = async (req, res) => {
     }
 
     // Validate anti-cheat
-    const isFlagged = checkAntiCheat(pendingSession, wpm, accuracy, duration, text, errors);
+    const antiCheatReason = checkAntiCheat(pendingSession, wpm, accuracy, duration, text, errors);
+    const isFlagged = antiCheatReason !== null;
+
+    if (isFlagged) {
+      // Log details into AuditLog
+      await AuditLog.create({
+        user: req.userId,
+        sessionId,
+        reason: antiCheatReason,
+        details: { wpm, accuracy, errors, duration, textLength: text ? text.length : 0 },
+        ip: req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+        userAgent: req.headers['user-agent']
+      });
+    }
 
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     const modeConfig = GAME_MODES[pendingSession.subtype] || GAME_MODES.custom;
+    const isVerified = !isFlagged;
 
     // Save stats
     const newStat = {
@@ -160,13 +174,16 @@ exports.saveStats = async (req, res) => {
       textId: pendingSession.testId || null,
       consistency: consistency || null,
       isFlagged,
+      verified: isVerified,
+      legacy: false,
+      season: GAME_MODES.CURRENT_SEASON,
       date: new Date()
     };
     user.stats.push(newStat);
     const savedStat = user.stats[user.stats.length - 1];
 
-    // Personal best checks
-    if (modeConfig.personalBest === true && !isFlagged && wpm > user.bestWpm) {
+    // Personal best checks (Verified competitive in CURRENT_SEASON only)
+    if (modeConfig.personalBest === true && isVerified && wpm > user.bestWpm) {
       user.bestWpm = wpm;
     }
 
@@ -207,29 +224,29 @@ exports.saveStats = async (req, res) => {
       }
     }
 
-    // Achievements Checking
+    // Achievements Checking (Verified competitive in CURRENT_SEASON only)
     const newAchievementsUnlocked = [];
-    if (modeConfig.achievements === true && !isFlagged) {
+    if (modeConfig.achievements === true && isVerified) {
       const currentAchievements = user.achievements.map(a => a.name);
 
       if (wpm >= 100 && !currentAchievements.includes('Speed Demon')) {
-        user.achievements.push({ name: 'Speed Demon' });
+        user.achievements.push({ name: 'Speed Demon', legacy: false });
         newAchievementsUnlocked.push('Speed Demon');
       }
 
       if (accuracy >= 99 && !currentAchievements.includes('Perfect Form')) {
-        user.achievements.push({ name: 'Perfect Form' });
+        user.achievements.push({ name: 'Perfect Form', legacy: false });
         newAchievementsUnlocked.push('Perfect Form');
       }
 
-      const competitiveCount = user.stats.filter(s => s.category === 'COMPETITIVE' && !s.isFlagged).length;
+      const competitiveCount = user.stats.filter(s => s.category === 'COMPETITIVE' && s.verified && !s.legacy && s.season === GAME_MODES.CURRENT_SEASON && !s.isFlagged).length;
       if (competitiveCount >= 100 && !currentAchievements.includes('Consistent')) {
-        user.achievements.push({ name: 'Consistent' });
+        user.achievements.push({ name: 'Consistent', legacy: false });
         newAchievementsUnlocked.push('Consistent');
       }
 
       if (user.streak >= 5 && !currentAchievements.includes('Speedster Streak')) {
-        user.achievements.push({ name: 'Speedster Streak' });
+        user.achievements.push({ name: 'Speedster Streak', legacy: false });
         newAchievementsUnlocked.push('Speedster Streak');
       }
     }
@@ -237,7 +254,7 @@ exports.saveStats = async (req, res) => {
     await user.save();
 
     // Log Activity for competitive test completions
-    if (modeConfig.category === 'COMPETITIVE' && !isFlagged) {
+    if (modeConfig.category === 'COMPETITIVE' && isVerified) {
       await Activity.create({
         user: req.userId,
         username: user.username,
@@ -259,6 +276,44 @@ exports.saveStats = async (req, res) => {
       });
     }
 
+    // First verified competitive score celebration trigger
+    const verifiedCompSessions = user.stats.filter(s => 
+      s.category === 'COMPETITIVE' && 
+      s.verified && 
+      !s.legacy && 
+      s.season === GAME_MODES.CURRENT_SEASON && 
+      !s.isFlagged
+    );
+
+    let firstVerified = false;
+    let rank = -1;
+
+    if (modeConfig.category === 'COMPETITIVE' && isVerified && verifiedCompSessions.length === 1) {
+      firstVerified = true;
+      // Calculate current rank dynamically
+      const countRes = await User.aggregate([
+        { $unwind: '$stats' },
+        { 
+          $match: { 
+            'stats.category': 'COMPETITIVE',
+            'stats.verified': true,
+            'stats.legacy': false,
+            'stats.season': GAME_MODES.CURRENT_SEASON,
+            'stats.isFlagged': { $ne: true }
+          }
+        },
+        {
+          $group: {
+            _id: '$_id',
+            bestWpm: { $max: '$stats.wpm' }
+          }
+        },
+        { $match: { bestWpm: { $gt: wpm } } },
+        { $count: 'count' }
+      ]);
+      rank = countRes.length > 0 ? countRes[0].count + 1 : 1;
+    }
+
     // Session cleanup
     await PendingSession.deleteOne({ sessionId });
 
@@ -270,7 +325,11 @@ exports.saveStats = async (req, res) => {
       totalXp: user.xp,
       newAchievements: newAchievementsUnlocked,
       statId: savedStat._id,
-      isFlagged
+      isFlagged,
+      firstVerified,
+      rank,
+      wpm,
+      accuracy
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -282,12 +341,49 @@ exports.getStats = async (req, res) => {
     const user = await User.findById(req.userId).select('stats weakKeys bestWpm streak achievements raceWins raceLosses xp');
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const officialRank = await User.countDocuments({ bestWpm: { $gt: user.bestWpm } }) + 1;
+    // Official rank among verified competitive users in current season
+    let officialRank = '-';
+    const compStats = user.stats.filter(s => 
+      s.category === 'COMPETITIVE' && 
+      s.verified && 
+      !s.legacy && 
+      s.season === GAME_MODES.CURRENT_SEASON && 
+      !s.isFlagged
+    );
 
-    const competitiveStats = user.stats.filter(s => s.category === 'COMPETITIVE' && !s.isFlagged);
+    if (compStats.length > 0) {
+      const bestCompWpm = Math.max(...compStats.map(s => s.wpm));
+      
+      const rankPipeline = [
+        { $unwind: '$stats' },
+        {
+          $match: {
+            'stats.category': 'COMPETITIVE',
+            'stats.verified': true,
+            'stats.legacy': false,
+            'stats.season': GAME_MODES.CURRENT_SEASON,
+            'stats.isFlagged': { $ne: true }
+          }
+        },
+        {
+          $group: {
+            _id: '$_id',
+            bestWpm: { $max: '$stats.wpm' }
+          }
+        },
+        { $match: { bestWpm: { $gt: bestCompWpm } } },
+        { $count: 'count' }
+      ];
+      
+      const countRes = await User.aggregate(rankPipeline);
+      officialRank = countRes.length > 0 ? countRes[0].count + 1 : 1;
+    }
+
+    // Filter sessions
+    const competitiveStats = user.stats.filter(s => s.category === 'COMPETITIVE' && s.verified && !s.legacy && s.season === GAME_MODES.CURRENT_SEASON && !s.isFlagged);
     const practiceStats = user.stats.filter(s => s.category === 'PRACTICE' && !s.isFlagged);
 
-    const bestOfficialWpm = competitiveStats.length ? Math.max(...competitiveStats.map(s => s.wpm)) : user.bestWpm;
+    const bestOfficialWpm = competitiveStats.length ? Math.max(...competitiveStats.map(s => s.wpm)) : 0;
     const avgOfficialAcc = competitiveStats.length
       ? Math.round(competitiveStats.reduce((acc, s) => acc + s.accuracy, 0) / competitiveStats.length)
       : 0;
@@ -312,6 +408,20 @@ exports.getStats = async (req, res) => {
       totalPracticeChars += words * 5;
     });
 
+    // Career Overall Calculations (Including all non-flagged stats, legacy competitive, practice, etc.)
+    let totalCareerWords = 0;
+    let totalCareerChars = 0;
+    let totalCareerTime = 0;
+
+    user.stats.forEach(s => {
+      if (!s.isFlagged) {
+        totalCareerTime += (s.duration || 0);
+        const words = Math.round(s.wpm * ((s.duration || 0) / 60));
+        totalCareerWords += words;
+        totalCareerChars += words * 5;
+      }
+    });
+
     const summary = {
       official: {
         bestWpm: bestOfficialWpm,
@@ -326,13 +436,19 @@ exports.getStats = async (req, res) => {
         totalWords: totalPracticeWords,
         totalChars: totalPracticeChars,
         totalTime: totalPracticeTime
+      },
+      career: {
+        totalWords: totalCareerWords,
+        totalChars: totalCareerChars,
+        totalTime: totalCareerTime,
+        totalSessions: user.stats.filter(s => !s.isFlagged).length
       }
     };
 
     res.json({
       stats: user.stats,
       weakKeys: user.weakKeys,
-      bestWpm: user.bestWpm,
+      bestWpm: bestOfficialWpm, // Return verified best WPM
       streak: user.streak,
       achievements: user.achievements,
       raceWins: user.raceWins,

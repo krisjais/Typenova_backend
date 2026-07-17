@@ -77,4 +77,6 @@ GAME_MODES['zombie-escape'] = GAME_MODES.zombieEscape;
 GAME_MODES['type-racer'] = GAME_MODES.typeRacer;
 GAME_MODES['rocket-rush'] = GAME_MODES.rocketRush;
 
+GAME_MODES.CURRENT_SEASON = 1;
+
 module.exports = GAME_MODES;

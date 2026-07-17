@@ -11,6 +11,9 @@ const statSchema = new mongoose.Schema({
   textId: { type: String },
   consistency: { type: Number },
   isFlagged: { type: Boolean, default: false },
+  verified: { type: Boolean, default: false },
+  legacy: { type: Boolean, default: false },
+  season: { type: Number, default: 0 },
   date: { type: Date, default: Date.now },
 });
 
@@ -48,7 +51,8 @@ const userSchema = new mongoose.Schema(
     achievements: [
       {
         name: { type: String, required: true },
-        unlockedAt: { type: Date, default: Date.now }
+        unlockedAt: { type: Date, default: Date.now },
+        legacy: { type: Boolean, default: false }
       }
     ],
   },
