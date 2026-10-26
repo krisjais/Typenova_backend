@@ -15,7 +15,7 @@ const statSchema = new mongoose.Schema({
   legacy: { type: Boolean, default: false },
   season: { type: Number, default: 0 },
   date: { type: Date, default: Date.now },
-});
+}, { suppressReservedKeysWarning: true });
 
 const weakKeySchema = new mongoose.Schema({
   key: String,
@@ -56,7 +56,7 @@ const userSchema = new mongoose.Schema(
       }
     ],
   },
-  { timestamps: true }
+  { timestamps: true, suppressReservedKeysWarning: true }
 );
 
 userSchema.pre('save', async function () {

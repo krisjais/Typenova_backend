@@ -523,4 +523,9 @@ module.exports = [
   {
     id: 'ja-code-medium',
     title: 'Haiki Yoso Map',
-    content: 'const shuzui = [1, 2, 3, 4, 5];
+    content: 'const shuzui = [1, 2, 3, 4, 5];',
+    category: 'Code Snippets',
+    difficulty: 'Medium',
+    language: 'Japanese'
+  }
+];
